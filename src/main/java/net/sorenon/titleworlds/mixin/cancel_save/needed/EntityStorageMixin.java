@@ -2,7 +2,6 @@ package net.sorenon.titleworlds.mixin.cancel_save.needed;
 
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.chunk.storage.EntityStorage;
-import net.sorenon.titleworlds.SnapshotCreateServer;
 import net.sorenon.titleworlds.TitleWorldsMod;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
@@ -23,9 +22,7 @@ public class EntityStorageMixin {
      */
     @Inject(method = "storeEntities", at = @At("HEAD"), cancellable = true)
     void cancelSave(CallbackInfo ci) {
-        if (TitleWorldsMod.state.isTitleWorld && TitleWorldsMod.state.noSave
-                || (this.level.getServer() instanceof SnapshotCreateServer snapshotCreateServer
-                && snapshotCreateServer.cancelSaveEntity.get())) {
+        if (TitleWorldsMod.state.isTitleWorld && TitleWorldsMod.state.noSave) {
             ci.cancel();
         }
     }

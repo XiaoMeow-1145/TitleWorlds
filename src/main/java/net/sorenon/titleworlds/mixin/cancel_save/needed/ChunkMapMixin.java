@@ -5,7 +5,6 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.ChunkStatus;
-import net.sorenon.titleworlds.SnapshotCreateServer;
 import net.sorenon.titleworlds.TitleWorldsMod;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
@@ -30,8 +29,7 @@ public abstract class ChunkMapMixin {
      */
     @Inject(method = "save", at = @At(value = "INVOKE", target = "Lnet/minecraft/util/profiling/ProfilerFiller;incrementCounter(Ljava/lang/String;)V"), cancellable = true)
     void cancelSave(ChunkAccess chunkAccess, CallbackInfoReturnable<Boolean> cir) {
-        if (TitleWorldsMod.state.isTitleWorld && TitleWorldsMod.state.noSave
-                || this.level.getServer() instanceof SnapshotCreateServer) {
+        if (TitleWorldsMod.state.isTitleWorld && TitleWorldsMod.state.noSave) {
             this.markPosition(chunkAccess.getPos(), chunkAccess.getStatus().getChunkType());
             cir.setReturnValue(true);
         }

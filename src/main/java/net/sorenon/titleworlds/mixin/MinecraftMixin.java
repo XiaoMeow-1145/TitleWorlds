@@ -1,32 +1,39 @@
 package net.sorenon.titleworlds.mixin;
 
-import com.mojang.authlib.GameProfileRepository;
-import com.mojang.authlib.minecraft.MinecraftSessionService;
 import com.mojang.authlib.yggdrasil.YggdrasilAuthenticationService;
 import net.minecraft.CrashReport;
 import net.minecraft.CrashReportCategory;
 import net.minecraft.ReportedException;
-import net.minecraft.Util;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.User;
+import net.minecraft.client.gui.chat.NarratorChatListener;
 import net.minecraft.client.gui.screens.*;
+import net.minecraft.client.gui.screens.worldselection.WorldOpenFlows;
 import net.minecraft.client.main.GameConfig;
 import net.minecraft.client.multiplayer.ClientHandshakePacketListenerImpl;
 import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.multiplayer.ClientPacketListener;
+import net.minecraft.client.multiplayer.ProfileKeyPairManager;
 import net.minecraft.client.server.IntegratedServer;
-import net.minecraft.commands.Commands;
-import net.minecraft.core.RegistryAccess;
 import net.minecraft.network.Connection;
 import net.minecraft.network.ConnectionProtocol;
 import net.minecraft.network.protocol.handshake.ClientIntentionPacket;
 import net.minecraft.network.protocol.login.ServerboundHelloPacket;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.Services;
 import net.minecraft.server.WorldStem;
 import net.minecraft.server.level.progress.ProcessorChunkProgressListener;
 import net.minecraft.server.level.progress.StoringChunkProgressListener;
+import net.minecraft.server.packs.PackType;
+import net.minecraft.server.packs.repository.FolderRepositorySource;
 import net.minecraft.server.packs.repository.PackRepository;
+import net.minecraft.server.packs.repository.PackSource;
+import net.minecraft.server.packs.repository.ServerPacksSource;
 import net.minecraft.server.players.GameProfileCache;
+import net.minecraft.util.profiling.ProfilerFiller;
 import net.minecraft.util.thread.ReentrantBlockableEventLoop;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.entity.SkullBlockEntity;
 import net.minecraft.world.level.storage.*;
 import net.sorenon.titleworlds.TitleWorldsMod;
@@ -40,7 +47,6 @@ import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
-import oshi.util.tuples.Pair;
 import oshi.util.tuples.Triplet;
 
 import java.io.File;
@@ -48,13 +54,14 @@ import java.io.IOException;
 import java.net.Proxy;
 import java.net.SocketAddress;
 import java.util.List;
+import java.util.Objects;
 import java.util.Queue;
 import java.util.Random;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.function.Function;
+import java.util.function.Supplier;
 
 @Mixin(Minecraft.class)
 public abstract class MinecraftMixin extends ReentrantBlockableEventLoop<Runnable> {
@@ -108,9 +115,11 @@ public abstract class MinecraftMixin extends ReentrantBlockableEventLoop<Runnabl
     @Shadow
     private volatile boolean running;
 
+    @Shadow public abstract ProfileKeyPairManager getProfileKeyPairManager();
+
     @Shadow
-    private static PackRepository createPackRepository(LevelStorageSource.LevelStorageAccess levelStorageAccess) {
-        throw new UnsupportedOperationException();
+    public static Minecraft getInstance() {
+        return null;
     }
 
     @Unique
@@ -131,11 +140,7 @@ public abstract class MinecraftMixin extends ReentrantBlockableEventLoop<Runnabl
                     this.runTick(false);
                 }
                 activeLoadingFuture = null;
-                if (cleanup != null) {
-                    cleanup.run();
-                }
             }
-
             if (singleplayerServer != null) {
                 // Ensure the server has initialized so we don't orphan it
                 while (!this.singleplayerServer.isReady()) {
@@ -201,17 +206,43 @@ public abstract class MinecraftMixin extends ReentrantBlockableEventLoop<Runnabl
     @Unique
     public boolean tryLoadTitleWorld() {
         try {
-            List<LevelSummary> list = TitleWorldsMod.levelSource.getLevelList();
+            List<LevelSummary> list = TitleWorldsMod.levelSource.loadLevelSummaries(TitleWorldsMod.levelSource.findLevelCandidates()).get();
             if (list.isEmpty()) {
                 LOGGER.info("TitleWorlds folder is empty");
                 return false;
             }
-            this.loadTitleWorld(list.get(random.nextInt(list.size())).getLevelId(), WorldStem.DataPackConfigSupplier::loadFromWorld, WorldStem.WorldDataSupplier::loadFromWorld);
+
+            var worldResourcesFuture
+                    = CompletableFuture.supplyAsync(() -> loadWorld(list));
+            activeLoadingFuture = worldResourcesFuture;
+            LOGGER.info("Waiting for WorldStem to load");
+            while (!worldResourcesFuture.isDone()) {
+                this.runAllTasks();
+                this.runTick(false);
+            }
+            this.loadTitleWorld(list.get(random.nextInt(list.size())).getLevelId(), worldResourcesFuture.get().getA(), worldResourcesFuture.get().getB(), worldResourcesFuture.get().getC());
             return true;
-        } catch (ExecutionException | InterruptedException | LevelStorageException e) {
+        } catch (Exception e) {
             LOGGER.error("Exception when loading title world", e);
             return false;
         }
+    }
+
+    private Triplet<LevelStorageSource.LevelStorageAccess, PackRepository, WorldStem> loadWorld(List<LevelSummary> list) {
+        try {
+            LevelStorageSource.LevelStorageAccess access = TitleWorldsMod.levelSource.createAccess(list.get(random.nextInt(list.size())).getLevelId());
+            WorldOpenFlows flows = new WorldOpenFlows(getInstance(), TitleWorldsMod.levelSource);
+            var completableFuture = flows.loadWorldStem(access, false);
+            PackRepository pr = createPackRepository(access);
+            return new Triplet<>(access, pr, completableFuture);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    @Unique
+    private static PackRepository createPackRepository(LevelStorageSource.LevelStorageAccess levelStorageAccess) {
+        return new PackRepository(PackType.SERVER_DATA, new ServerPacksSource(), new FolderRepositorySource(levelStorageAccess.getLevelPath(LevelResource.DATAPACK_DIR).toFile(), PackSource.WORLD));
     }
 
     @Unique
@@ -222,70 +253,51 @@ public abstract class MinecraftMixin extends ReentrantBlockableEventLoop<Runnabl
     @Nullable
     private Runnable cleanup = null;
 
+    @Shadow @Final private YggdrasilAuthenticationService authenticationService;
+    @Shadow private ProfilerFiller profiler;
+    @Shadow @Nullable private Supplier<CrashReport> delayedCrash;
+    @Shadow
+    public static void crash(CrashReport report) {
+    }
+    @Shadow @Final private ProfileKeyPairManager profileKeyPairManager;
+
+    @Shadow public abstract void clearLevel();
+
+    @Shadow public abstract void clearLevel(Screen screen);
+
+    @Shadow protected abstract ItemStack addCustomNbtData(ItemStack stack, BlockEntity blockEntity);
+
     @Unique
-    private void loadTitleWorld(String levelName,
-                                Function<LevelStorageSource.LevelStorageAccess, WorldStem.DataPackConfigSupplier> dataPackConfigSupplier,
-                                Function<LevelStorageSource.LevelStorageAccess, WorldStem.WorldDataSupplier> worldDataSupplier
-    ) throws ExecutionException, InterruptedException {
-        LOGGER.info("Loading title world");
-        TitleWorldsMod.state.isTitleWorld = true;
-        TitleWorldsMod.state.pause = false;
-
-        var worldResourcesFuture
-                = CompletableFuture.supplyAsync(() -> openWorldResources(levelName, dataPackConfigSupplier, worldDataSupplier, false));
-
-        activeLoadingFuture = worldResourcesFuture;
-        cleanup = () -> {
-            try {
-                var worldResources = worldResourcesFuture.get();
-                worldResources.getA().close();
-                worldResources.getB().close();
-            } catch (InterruptedException | ExecutionException | IOException e) {
-                LOGGER.error("Exception caught when cleaning up async world load stage 1", e);
-            }
-        };
-
-        LOGGER.info("Loading world resources");
-        while (!worldResourcesFuture.isDone()) {
-            this.runAllTasks();
-            this.runTick(false);
-            if (!TitleWorldsMod.state.isTitleWorld) {
-                return;
-            }
-        }
-
-        var worldResources = worldResourcesFuture.get();
-        LevelStorageSource.LevelStorageAccess levelStorageAccess = worldResources.getA();
-        PackRepository packRepository = worldResources.getB();
-        CompletableFuture<WorldStem> worldStemCompletableFuture = worldResources.getC();
-
-        activeLoadingFuture = worldStemCompletableFuture;
-        cleanup = () -> {
-            try {
-                levelStorageAccess.close();
-                packRepository.close();
-                worldStemCompletableFuture.get().close();
-            } catch (InterruptedException | ExecutionException | IOException e) {
-                TitleWorldsMod.LOGGER.error("Exception caught when cleaning up async world load stage 2", e);
-            }
-        };
-
-        LOGGER.info("Waiting for WorldStem to load");
-        while (!worldStemCompletableFuture.isDone()) {
-            this.runAllTasks();
-            this.runTick(false);
-            if (!TitleWorldsMod.state.isTitleWorld) {
-                return;
-            }
-        }
-
-        WorldStem worldStem = worldStemCompletableFuture.get();
-
-        this.progressListener.set(null);
-
+    private void loadTitleWorld(String string, LevelStorageSource.LevelStorageAccess levelStorageAccess, PackRepository packRepository, WorldStem worldStem) throws ExecutionException, InterruptedException {
         LOGGER.info("Starting server");
-        activeLoadingFuture = CompletableFuture.runAsync(() -> startSingleplayerServer(levelName, levelStorageAccess, worldStem, packRepository));
-        cleanup = null;
+        activeLoadingFuture = CompletableFuture.runAsync(() -> {
+            TitleWorldsMod.state.isTitleWorld = true;
+            TitleWorldsMod.state.pause = false;
+
+            LOGGER.info("Loading title world");
+
+            try {
+                levelStorageAccess.saveDataTag(worldStem.registryAccess(), worldStem.worldData());
+                Services services = Services.create(this.authenticationService, this.gameDirectory);
+                services.profileCache().setExecutor(this);
+                SkullBlockEntity.setup(services, this);
+                GameProfileCache.setUsesAuthentication(false);
+                this.singleplayerServer = MinecraftServer.spin((thread) -> new IntegratedServer(thread, this.getInstance(), levelStorageAccess, packRepository, worldStem, services, (i) -> {
+                    StoringChunkProgressListener storingChunkProgressListener = new StoringChunkProgressListener(i + 0);
+                    this.progressListener.set(storingChunkProgressListener);
+                    Queue var10001 = this.progressTasks;
+                    Objects.requireNonNull(var10001);
+                    return ProcessorChunkProgressListener.createStarted(storingChunkProgressListener, var10001::add);
+                }));
+                this.isLocalServer = true;
+            } catch (Throwable var9) {
+                CrashReport crashReport = CrashReport.forThrowable(var9, "Starting integrated server");
+                CrashReportCategory crashReportCategory = crashReport.addCategory("Starting integrated server");
+                crashReportCategory.setDetail("Level ID", string);
+                crashReportCategory.setDetail("Level Name", () -> worldStem.worldData().getLevelName());
+                throw new ReportedException(crashReport);
+            }
+        });
 
         while (singleplayerServer == null || !this.singleplayerServer.isReady()) {
             this.runAllTasks();
@@ -296,7 +308,15 @@ public abstract class MinecraftMixin extends ReentrantBlockableEventLoop<Runnabl
         }
 
         LOGGER.info("Joining singleplayer server");
-        var joinServerFuture = CompletableFuture.runAsync(this::joinSingleplayerServer);
+        var joinServerFuture = CompletableFuture.runAsync(() -> {
+            SocketAddress socketAddress = this.singleplayerServer.getConnection().startMemoryChannel();
+            Connection connection = Connection.connectToLocalServer(socketAddress);
+            connection.setListener(new ClientHandshakePacketListenerImpl(connection, this.getInstance(), (Screen)null, (component) -> {
+            }));
+            connection.send(new ClientIntentionPacket(socketAddress.toString(), 0, ConnectionProtocol.LOGIN));
+            this.pendingConnection = connection;
+            connection.send(new ServerboundHelloPacket(this.getUser().getName(), this.profileKeyPairManager.profilePublicKeyData()));
+        });
 
         activeLoadingFuture = joinServerFuture;
 
@@ -310,88 +330,5 @@ public abstract class MinecraftMixin extends ReentrantBlockableEventLoop<Runnabl
         activeLoadingFuture = null;
 
         LOGGER.info("Logging into title world");
-    }
-
-    @Unique
-    private Triplet<LevelStorageSource.LevelStorageAccess, PackRepository, CompletableFuture<WorldStem>> openWorldResources(
-            String levelName,
-            Function<LevelStorageSource.LevelStorageAccess, WorldStem.DataPackConfigSupplier> dataPackConfigSupplierFunction,
-            Function<LevelStorageSource.LevelStorageAccess, WorldStem.WorldDataSupplier> worldDataSupplierFunction,
-            boolean vanillaOnly
-    ) {
-        LevelStorageSource.LevelStorageAccess levelStorageAccess;
-        try {
-            levelStorageAccess = TitleWorldsMod.levelSource.createAccess(levelName);
-        } catch (IOException var21) {
-            throw new RuntimeException("Failed to read data");
-        }
-
-        var dataPackConfigSupplier = dataPackConfigSupplierFunction.apply(levelStorageAccess);
-        var worldDataSupplier = worldDataSupplierFunction.apply(levelStorageAccess);
-        var packRepository = createPackRepository(levelStorageAccess);
-        var initConfig = new WorldStem.InitConfig(packRepository, Commands.CommandSelection.INTEGRATED, 2, vanillaOnly);
-        var completableFuture = WorldStem.load(
-                initConfig, dataPackConfigSupplier, worldDataSupplier, Util.backgroundExecutor(), this
-        );
-
-        return new Triplet<>(levelStorageAccess, packRepository, completableFuture);
-    }
-
-    @Unique
-    private void startSingleplayerServer(
-            String levelName,
-            LevelStorageSource.LevelStorageAccess levelStorageAccess,
-            WorldStem worldStem,
-            PackRepository packRepository
-    ) {
-        WorldData worldData = worldStem.worldData();
-        this.progressListener.set(null);
-
-        try {
-            RegistryAccess.Frozen registryAccess = worldStem.registryAccess();
-            levelStorageAccess.saveDataTag(registryAccess, worldData);
-            worldStem.updateGlobals();
-            YggdrasilAuthenticationService iOException4 = new YggdrasilAuthenticationService(this.proxy);
-            MinecraftSessionService minecraftSessionService = iOException4.createMinecraftSessionService();
-            GameProfileRepository gameProfileRepository = iOException4.createProfileRepository();
-            GameProfileCache gameProfileCache = new GameProfileCache(gameProfileRepository, new File(this.gameDirectory, MinecraftServer.USERID_CACHE_FILE.getName()));
-            gameProfileCache.setExecutor((Minecraft) (Object) this);
-            SkullBlockEntity.setup(gameProfileCache, minecraftSessionService, this);
-            GameProfileCache.setUsesAuthentication(false);
-            this.singleplayerServer = MinecraftServer.spin(thread -> new IntegratedServer(thread, (Minecraft) (Object) this, levelStorageAccess, packRepository, worldStem, minecraftSessionService, gameProfileRepository, gameProfileCache, i -> {
-                StoringChunkProgressListener storingChunkProgressListener = new StoringChunkProgressListener(i);
-                this.progressListener.set(storingChunkProgressListener);
-                return ProcessorChunkProgressListener.createStarted(storingChunkProgressListener, this.progressTasks::add);
-            }));
-            this.isLocalServer = true;
-        } catch (Throwable var19) {
-            CrashReport minecraftSessionService = CrashReport.forThrowable(var19, "Starting integrated server");
-            CrashReportCategory gameProfileRepository = minecraftSessionService.addCategory("Starting integrated server");
-            gameProfileRepository.setDetail("Level ID", levelName);
-            gameProfileRepository.setDetail("Level Name", worldData.getLevelName());
-            throw new ReportedException(minecraftSessionService);
-        }
-    }
-
-    @Unique
-    private void joinSingleplayerServer() {
-        SocketAddress minecraftSessionService = this.singleplayerServer.getConnection().startMemoryChannel();
-        Connection pendingConnection = Connection.connectToLocalServer(minecraftSessionService);
-
-        pendingConnection.setListener(
-                new ClientHandshakePacketListenerImpl(
-                        pendingConnection,
-                        (Minecraft) (Object) this,
-                        null,
-                        component -> {
-                        }
-                )
-        );
-
-        pendingConnection.send(new ClientIntentionPacket(minecraftSessionService.toString(), 0, ConnectionProtocol.LOGIN));
-
-        //this.pendingConnection must be set before sending ServerboundHelloPacket or a rare crash can occur
-        this.pendingConnection = pendingConnection;
-        pendingConnection.send(new ServerboundHelloPacket(this.getUser().getGameProfile()));
     }
 }

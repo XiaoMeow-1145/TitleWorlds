@@ -3,7 +3,6 @@ package net.sorenon.titleworlds.mixin.cancel_save.needed;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.server.players.PlayerList;
-import net.sorenon.titleworlds.SnapshotCreateServer;
 import net.sorenon.titleworlds.TitleWorldsMod;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
@@ -22,8 +21,7 @@ public class PlayerListMixin {
      */
     @Inject(method = "save", at = @At("HEAD"), cancellable = true)
     void cancelSave(ServerPlayer serverPlayer, CallbackInfo ci) {
-        if (TitleWorldsMod.state.isTitleWorld && TitleWorldsMod.state.noSave
-                || this.server instanceof SnapshotCreateServer) {
+        if (TitleWorldsMod.state.isTitleWorld && TitleWorldsMod.state.noSave) {
             ci.cancel();
         }
     }
