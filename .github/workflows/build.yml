@@ -31,5 +31,5 @@ jobs:
         if: ${{ runner.os == 'Linux' }} # Only upload artifacts built from latest java on one OS
         uses: actions/upload-artifact@v2
         with:
-          name: Artifacts
-          path: build/libs/
+          name: title-worlds
+          path: build/libs/titleworlds-0.1.0+1.19.jar
