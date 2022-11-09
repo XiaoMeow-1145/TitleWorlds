@@ -36,6 +36,7 @@ import net.minecraft.server.level.progress.StoringChunkProgressListener;
 import net.minecraft.server.packs.repository.PackRepository;
 import net.minecraft.server.players.GameProfileCache;
 import net.minecraft.util.thread.ReentrantBlockableEventLoop;
+import net.minecraft.world.entity.player.ProfilePublicKey;
 import net.minecraft.world.level.DataPackConfig;
 import net.minecraft.world.level.block.entity.SkullBlockEntity;
 import net.minecraft.world.level.storage.LevelStorageException;
@@ -461,7 +462,8 @@ public abstract class MinecraftMixin extends ReentrantBlockableEventLoop<Runnabl
         pendingConnection.send(new ClientIntentionPacket(minecraftSessionService.toString(), 0, ConnectionProtocol.LOGIN));
 
         //this.pendingConnection must be set before sending ServerboundHelloPacket or a rare crash can occur
+        CompletableFuture<Optional<ProfilePublicKey.Data>> completableFuture = this.profileKeyPairManager.preparePublicKey();
         this.pendingConnection = pendingConnection;
-        pendingConnection.send(new ServerboundHelloPacket(this.getUser().getName(), this.profileKeyPairManager.profilePublicKeyData(), Optional.ofNullable(this.getUser().getProfileId())));
+        pendingConnection.send(new ServerboundHelloPacket(this.getUser().getName(), completableFuture.join(), Optional.ofNullable(this.getUser().getProfileId())));
     }
 }
